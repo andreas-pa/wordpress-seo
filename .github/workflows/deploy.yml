@@ -1,0 +1,384 @@
+name: Deploy
+
+##############################################################################
+# WARNING!
+# The deploy workflow (re-)uses information retrieved from the original
+# commit which triggered the workflow, such as the branch name, the committer,
+# and the commit message.
+#
+# This type of data should always be regarded as **untrusted** input and when
+# these `github....` variables are used directly within the `run` context,
+# they can lead to script injection and unintended execution of commands.
+#
+# To mitigate the risk of these type of script injection attacks, untrusted
+# data is first set as a step-specific interim environment variable and only
+# after that the environment variable (not the github variables directly)
+# is used in the `run` context.
+#
+# This complies with the current best practices regarding defending against
+# these type of attacks as per January 2022.
+# For more information, see:
+# https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions
+##############################################################################
+
+on:
+  # Trigger the workflow whenever a new tag is created.
+  push:
+    # Trigger the workflow on select branches.
+    branches:
+      - trunk
+      - 'release/**'
+      - 'hotfix/[0-9]+.[0-9]+*'
+      - 'feature/**'
+    # Trigger the workflow whenever a new tag is created.
+    tags:
+      - '**'
+  # Allow manually triggering the workflow.
+  workflow_dispatch:
+
+
+#branches:
+#  only:
+#    - master
+#    - trunk
+#    - /^release\/*/
+#    - /^hotfix\/\d+\.\d+(\.\d+)?(-\S*)?$/
+#    - /^feature\/*/
+    # Also build tags like 1.1.1 or 1.1 for deployment.
+#    - /^\d+\.\d+(\.\d+)?(-\S*)?$/
+
+#      if: ( tag IS present OR branch =~ /^feature\// OR branch =~ /^release\// OR branch =~ /^hotfix\// OR branch = trunk ) AND type != pull_request
+
+
+# Cancels all previous workflow runs for the same branch that have not yet completed.
+concurrency:
+  # The concurrency group contains the workflow name and the branch name.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DIST_ORG: 'Yoast-dist'
+  DIST_DEFAULT_BRANCH: 'master'
+
+jobs:
+  prepare:
+    name: "Prepare the artifact"
+    # Don't run on forks.
+    if: github.repository_owner == 'Yoast'
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: 7.2
+          coverage: none
+#        env:
+          # Token is needed for the YoastSEO install via VCS.
+#          COMPOSER_TOKEN: ${{ secrets.YOASTBOT_CI_PAT_DIST }}
+
+      # This action also handles the caching of the Yarn dependencies.
+      # https://github.com/actions/setup-node
+      - name: Set up node and enable caching of dependencies
+        uses: actions/setup-node@v3
+        with:
+          node-version: '14'
+          cache: 'yarn'
+
+      - name: "Debug info: show tooling versions"
+        run: |
+          php -v
+          node --version
+          npm --version
+          yarn --version
+          grunt --version
+          git --version
+
+      # Install dependencies and handle caching in one go.
+      # The Grunt artifact creation will run `composer install` multiple times (both no-dev as well as dev),
+      # however, Composer packages downloaded are not cached via Grunt.
+      # Running `composer install` ahead of time will ensure that the cache is warmed up
+      # and available across runs of the same workflow.
+      # @link https://github.com/marketplace/actions/install-composer-dependencies
+      - name: Install Composer dependencies and run the prefixing script
+        uses: ramsey/composer-install@v2
+
+      # Remove packages which are only used for the prefixing.
+      # - humbug/php-scoper is only needed to actually do the prefixing, so won't be shipped anyway.
+      # - league/oauth2-client and its dependencies *are* the packages being prefixed.
+      - name: Delete dependencies which are only needed for the prefixing
+        run: composer remove --dev --no-scripts humbug/php-scoper league/oauth2-client
+
+      - name: Remove vendor directory
+        run: rm -rf vendor/*
+
+      - name: "Debug info: show directory layout"
+        run: tree -dC .
+
+      - name: Yarn install
+        run: yarn install
+
+      - name: "Grunt: set package version (tags only)"
+        if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: grunt set-version -new-version="$REF_NAME"
+
+      - name: "Grunt: update package version (tags only)"
+        if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+        run: grunt update-version
+
+      - name: "Grunt: create artifact"
+        run: grunt artifact
+
+      - name: "Debug info: show contents of artifacts directory"
+        run: tree -aC ./artifact
+
+      - name: "Debug info: check git status"
+        run: git status -b -v -u
+
+      # Retention is normally 90 days, but this artifact is only for review
+      # and use in the next step, so no need to keep it for more than a day.
+      - name: Upload the artifact folder
+        uses: actions/upload-artifact@v3
+        if: ${{ success() }}
+        with:
+          name: deploy-artifact
+          path: ./artifact
+          if-no-files-found: error
+          retention-days: 1
+#######################################
+#install:
+#  - |
+#    if [[ "$TRAVIS_BUILD_STAGE_NAME" == "🚀 deployment" ]]; then
+      # The prefix-dependencies task only works on PHP 7.1 and we need to prefix our dependencies to accurately test them.
+      # So we temporarily switch PHP versions, do a full install and then remove the package.
+      # Then switch back to the PHP version we want to test and delete the vendor directory.
+#      phpenv local 7.1
+#      travis_retry composer install --no-interaction --ignore-platform-reqs
+#      travis_retry composer remove humbug/php-scoper --dev --ignore-platform-reqs --no-interaction
+#      travis_retry composer remove atanamo/php-codeshift --dev --ignore-platform-reqs --no-interaction
+      # Dependency injection compilation only works on PHP 7+.
+      # It makes use of reflection-based PHP code that only works on PHP 7+.
+#      travis_retry composer du
+#      phpenv local --unset
+#      rm -rf vendor/*
+#    fi
+#  - |
+#    if [[ "$TRAVIS_BUILD_STAGE_NAME" == "🚀 deployment" ]]; then
+#      travis_retry composer update --no-interaction
+#      travis_retry composer install --no-dev --no-interaction
+#      composer du
+#    fi
+#
+#      script:
+#        - |
+#          if [[ ! -z "$TRAVIS_TAG" ]]; then
+#            grunt set-version -new-version=$TRAVIS_TAG
+#            grunt update-version
+#          fi
+#        - grunt artifact
+#######################################
+
+
+  deploy:
+    name: "Deploy to dist"
+    # Don't run on forks.
+    if: github.repository_owner == 'Yoast'
+
+    needs: prepare
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "Set variable: short sha"
+        id: set_sha
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          shortsha=$(echo "$SHA" | cut -b 1-6)
+          echo "::set-output name=SHORTSHA::$shortsha"
+
+      - name: "Set variables: target branch, commit title"
+        id: set_vars
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ "${{ github.event_name }}" == 'push' && "${{ github.ref_type }}" == 'branch' && "$REF_NAME" != "${{ env.DIST_DEFAULT_BRANCH }}" ]]; then
+            echo "::set-output name=BRANCH::$REF_NAME"
+            echo "::set-output name=TITLE::Syncing branch $REF_NAME (sha: ${{ steps.set_sha.outputs.SHORTSHA }})"
+          elif [[ "${{ github.event_name }}" == 'workflow_dispatch' && "$REF_NAME" != "${{ env.DIST_DEFAULT_BRANCH }}" ]]; then
+            echo "::set-output name=BRANCH::$REF_NAME"
+            echo "::set-output name=TITLE::Manual deploy for $REF_NAME (sha: ${{ steps.set_sha.outputs.SHORTSHA }})"
+          else # = Pushed tag.
+            echo "::set-output name=BRANCH::${{ env.DIST_DEFAULT_BRANCH }}"
+            echo "::set-output name=TITLE::Release $REF_NAME"
+          fi
+
+      - name: Checkout Yoast Dist repo
+        uses: actions/checkout@v3
+        with:
+          repository: ${{ env.DIST_ORG }}/${{ github.event.repository.name }}
+          ref: ${{ env.DIST_DEFAULT_BRANCH }}
+          # Personal Access Token for (push) access to the dist version of the repo.
+          token: ${{ secrets.YOASTBOT_CI_PAT_DIST }}
+          fetch-depth: 0
+
+      - name: "Create branch/Switch to branch"
+        if: ${{ steps.set_vars.outputs.BRANCH != env.DIST_DEFAULT_BRANCH }}
+        run: git checkout ${{ steps.set_vars.outputs.BRANCH }} 2>/dev/null || git checkout -b ${{ steps.set_vars.outputs.BRANCH }}
+
+      # Clean out all files to make sure that deleted files will actually
+      # be deleted when the artifact gets put in place.
+      - name: Remove all files
+        run: |
+          # Enable extended pattern matching.
+          shopt -s extglob
+          # Remove everything, except the ".git" directory and the `composer.json` file.
+          rm -vrf !(.git/*|composer.json)
+          # Disable extended pattern matching.
+          shopt -u extglob
+
+      # After the previous step, only the `.git` directory and its contents and the `composer.json` file should remain.
+      - name: "Debug info: show contents of root directory after cleaning"
+        run: tree -aC .
+
+      # The artifact will be unpacked into the root directory of the repository.
+      - name: Download and unpack the prepared artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: deploy-artifact
+
+      - name: "Debug info: show contents of root directory after artifact insertion"
+        run: tree -aC .
+
+# Check if this is correct/still needed!
+      - name: Remove the vendor directory
+        run: rm -rf ./artifact/vendor
+
+      - name: "Debug info: check git status"
+        run: git status -b -v -u
+
+      - name: Set Git config
+        env:
+          ACTOR: ${{ github.actor }}
+        run: |
+          git config user.name 'GitHub Action'
+          git config user.email "$ACTOR@users.noreply.github.com"
+
+      - name: Stage files
+        run: git add -A
+
+      - name: "Commit the files (branch)"
+        if: ${{ github.event_name != 'push' || github.ref_type != 'tag' }}
+        env:
+          COMMITTER: ${{ github.event.head_commit.committer.username }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          COMMIT_URL: ${{ github.event.head_commit.url }}
+          COMMIT_TIME: ${{ github.event.head_commit.timestamp }}
+        run: |
+          git commit --allow-empty -m "${{ steps.set_vars.outputs.TITLE }}" \
+            -m "Synced up to commit hash: $COMMIT_URL" \
+            -m "Timestamp last commit: $COMMIT_TIME" \
+            -m "Committer last commit: @$COMMITTER" \
+            -m "" \
+            -m "Commit message last commit:" \
+            -m "---------------------------" \
+            -m "$COMMIT_MSG"
+
+      - name: "Commit the files (release)"
+        if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+        env:
+          COMMITTER: ${{ github.event.head_commit.committer.username }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          COMMIT_URL: ${{ github.event.head_commit.url }}
+          COMMIT_TIME: ${{ github.event.head_commit.timestamp }}
+        run: |
+          git commit -m "${{ steps.set_vars.outputs.TITLE }}" \
+            -m "Commit hash for tag: $COMMIT_URL" \
+            -m "Timestamp for tag: $COMMIT_TIME" \
+            -m "Committer for tag: @$COMMITTER" \
+            -m "" \
+            -m "Commit message last commit:" \
+            -m "---------------------------" \
+            -m "$COMMIT_MSG"
+
+      - name: "Tag the commit (releases only)"
+        if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: git tag "$REF_NAME" $(git rev-parse HEAD)
+
+#      - name: Push to target branch
+#        run: git push -u origin ${{ steps.set_vars.outputs.BRANCH }} --tags -v
+
+#################################
+
+#    - stage: 🚀 deployment
+#      name: "Deploy to Yoast-dist"
+      # If the commit was tagged, create an artifact and push it to the distribution github
+#      deploy:
+#        script: bash config/travis/deploy_to_dist.sh ${TRAVIS_TAG:-$TRAVIS_BRANCH} wordpress-seo
+#
+#set -ex
+#
+#if [ -z "$1" ]; then
+#    echo 'The first argument should be the version you want to deploy to dist.'
+#    exit 1
+#fi
+#
+#if [ -z "$2" ]; then
+#    echo 'The second argument should be the repo name.'
+#    exit 1
+#fi
+#
+# Repo to deploy to:
+#USER="Yoast-dist"
+#REPO=$2
+#REPO_URL="git@github.com:$USER/$REPO.git"
+#
+# Get the latest tag.
+#lastTag=$1
+#branch="master"
+#mainDir=$(pwd)
+#
+#if [[ $lastTag =~ ^feature/* || $lastTag =~ ^release/* || $lastTag =~ ^hotfix/* || $lastTag == "trunk" ]]; then
+#    branch=$lastTag
+#fi
+#
+# Clone the dist repo.
+#rm -rf ./dist-repo
+#git clone ${REPO_URL} dist-repo
+#cd dist-repo
+#git checkout $branch 2>/dev/null || git checkout -b $branch
+#cd ..
+#
+# Copy the git folder with the entire history.
+#cp -r ./dist-repo/.git ./artifact
+#cp composer.json ./artifact
+#
+# Remove the vendor directory from the artifact, composer will generate it's own autoload.
+#rm -rf ./artifact/vendor
+#
+# Navigate to the to be committed folder.
+#cd ./artifact
+#
+# Commit the files.
+#git add -A
+#
+# If it's a feature, release or trunk branch.
+#if [[ $lastTag =~ ^feature/* || $lastTag =~ ^release/* || $lastTag =~ ^hotfix/* || $lastTag == "trunk" ]]; then
+#    git commit --allow-empty -m "${TRAVIS_COMMIT_MESSAGE}"
+#else
+#    git commit -m "Release ${lastTag}"
+    # Tag the commit.
+#    lastTag=$(echo $lastTag | sed 's/^\([0-9]\+\.[0-9]\+\)$/\1.0/')
+#    git tag ${lastTag}
+#fi
+#
+# Push to remote.
+#git push -u origin $branch --tags
